@@ -59,23 +59,81 @@ void setupOLED() {
   delay(2000);
 }
 
+void setupGPS() {
+  // Wait a bit for module to initialize
+  delay(1000);
+  
+  Serial.println(COLOR_YELLOW "  ⚙️  Configuring GPS module..." COLOR_RESET);
+  
+  // Configure GPS to output recommended NMEA sentences
+  String configCommands[] = {
+    "$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28", // Enable GGA and RMC
+    "$PMTK301,2*2E", // Enable WAAS (SBAS)
+    "$PMTK313,1*2E", // Enable SBAS
+    "$PMTK319,1*24", // Set SBAS to test mode
+    "$PMTK220,1000*1F" // Set update rate to 1Hz
+  };
+  
+  for (int i = 0; i < 5; i++) {
+    GPS_SERIAL.println(configCommands[i]);
+    Serial.print(COLOR_BLUE "  📡 Sent: " COLOR_WHITE);
+    Serial.println(configCommands[i]);
+    delay(200);
+  }
+  
+  Serial.println(COLOR_GREEN "  ✅ GPS configuration complete" COLOR_RESET);
+}
+
 void updateOLED() {
   display.clearDisplay();
   display.setTextSize(1);
   
-  // Header
+  // Header with detailed fix status
   display.setCursor(0,0);
   display.print("AGNI GPS");
   display.setCursor(80,0);
+  
   if(gps.location.isValid()) {
-    display.print("FIX");
+    display.print("3D FIX");
+  } else if (gps.satellites.value() >= 4) {
+    display.print("2D FIX");
   } else {
     display.print("NO FIX");
   }
   
-  // Time and Date
+  // Satellite information (more prominent)
   display.setCursor(0,10);
-  if(gps.time.isValid() && gps.date.isValid()) {
+  display.print("Sats:");
+  display.print(gps.satellites.value());
+  display.print(" HDOP:");
+  if(gps.hdop.isValid()) {
+    display.print(gps.hdop.hdop(), 1);
+  } else {
+    display.print("---");
+  }
+  
+  // Location with more debugging info
+  display.setCursor(0,20);
+  if(gps.location.isValid()) {
+    display.print("Lat:");
+    display.print(gps.location.lat(), 6);
+  } else {
+    display.print("Lat: Waiting fix...");
+  }
+  
+  display.setCursor(0,30);
+  if(gps.location.isValid()) {
+    display.print("Lng:");
+    display.print(gps.location.lng(), 6);
+  } else {
+    display.print("Lng: Sats:");
+    display.print(gps.satellites.value());
+  }
+  
+  // Time
+  display.setCursor(0,40);
+  if(gps.time.isValid()) {
+    display.print("UTC ");
     display.print(gps.time.hour());
     display.print(":");
     if(gps.time.minute() < 10) display.print("0");
@@ -83,63 +141,15 @@ void updateOLED() {
     display.print(":");
     if(gps.time.second() < 10) display.print("0");
     display.print(gps.time.second());
-    
-    display.setCursor(70,10);
-    display.print(gps.date.day());
-    display.print("/");
-    display.print(gps.date.month());
-    display.print("/");
-    display.print(gps.date.year() % 100);
   } else {
     display.print("Time: --:--:--");
   }
   
-  // Location
-  display.setCursor(0,20);
-  if(gps.location.isValid()) {
-    display.print("Lat:");
-    display.print(gps.location.lat(), 4);
-  } else {
-    display.print("Lat: ---");
-  }
-  
-  display.setCursor(0,30);
-  if(gps.location.isValid()) {
-    display.print("Lng:");
-    display.print(gps.location.lng(), 4);
-  } else {
-    display.print("Lng: ---");
-  }
-  
-  // Satellite and Speed info
-  display.setCursor(0,40);
-  display.print("Sats:");
-  display.print(gps.satellites.value());
-  display.print(" Spd:");
-  if(gps.speed.isValid()) {
-    display.print(gps.speed.kmph(), 1);
-    display.print("km/h");
-  } else {
-    display.print("---");
-  }
-  
-  // HDOP and Altitude
+  // Additional status info
   display.setCursor(0,50);
-  display.print("HDOP:");
-  if(gps.hdop.isValid()) {
-    display.print(gps.hdop.hdop(), 1);
-  } else {
-    display.print("---");
-  }
-  
-  display.setCursor(70,50);
-  display.print("Alt:");
-  if(gps.altitude.isValid()) {
-    display.print(gps.altitude.meters(), 0);
-    display.print("m");
-  } else {
-    display.print("---");
-  }
+  display.print("Data: ");
+  display.print(dataReceived);
+  display.print(" chars");
   
   display.display();
 }
@@ -206,6 +216,9 @@ void printLocationData() {
     Serial.println(COLOR_WHITE "°" COLOR_RESET);
   } else {
     Serial.println(COLOR_RED "  ❌ Waiting for GPS fix..." COLOR_RESET);
+    Serial.print(COLOR_YELLOW "  💡 Current satellites: " COLOR_GREEN);
+    Serial.print(gps.satellites.value());
+    Serial.println(COLOR_YELLOW " (Need 4+ for 2D fix)" COLOR_RESET);
   }
 }
 
@@ -346,6 +359,40 @@ void printRawDataPreview() {
   }
 }
 
+void checkGPSStatus() {
+  static unsigned long lastStatusCheck = 0;
+  static int lastSatellites = 0;
+  
+  if (millis() - lastStatusCheck > 5000) {
+    lastStatusCheck = millis();
+    
+    Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
+    Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                     📊 GPS STATUS                      " COLOR_CYAN "│" COLOR_RESET);
+    Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
+    
+    Serial.print(COLOR_WHITE "  🛰️  Satellites: " COLOR_GREEN);
+    Serial.print(gps.satellites.value());
+    Serial.print(COLOR_WHITE " (Previous: " COLOR_YELLOW);
+    Serial.print(lastSatellites);
+    Serial.println(COLOR_WHITE ")" COLOR_RESET);
+    
+    Serial.print(COLOR_WHITE "  📍 Location:    ");
+    if (gps.location.isValid()) {
+      Serial.println(COLOR_GREEN "VALID FIX" COLOR_RESET);
+    } else {
+      Serial.println(COLOR_YELLOW "NO FIX" COLOR_RESET);
+    }
+    
+    if (gps.satellites.value() > lastSatellites) {
+      Serial.println(COLOR_GREEN "  📈 Satellites increasing - signal improving!" COLOR_RESET);
+    } else if (gps.satellites.value() < lastSatellites) {
+      Serial.println(COLOR_YELLOW "  📉 Satellites decreasing - check antenna position" COLOR_RESET);
+    }
+    
+    lastSatellites = gps.satellites.value();
+  }
+}
+
 void clearScreen() {
   // Clear screen and move cursor to top (works in most terminal emulators)
   Serial.print("\033[2J\033[H");
@@ -373,6 +420,10 @@ void setup() {
   GPS_SERIAL.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   
   Serial.println(COLOR_GREEN "  ✅ GPS Serial initialized on RX=GPIO20, TX=GPIO21" COLOR_RESET);
+  
+  // Configure GPS module
+  setupGPS();
+  
   Serial.println(COLOR_YELLOW "  📡 Listening for GPS data... (Timeout: 30 seconds)" COLOR_RESET);
   Serial.println();
   
@@ -406,23 +457,33 @@ void setup() {
 }
 
 void loop() {
-  // Read and process GPS data
+  // Improved GPS data reading
+  static String nmeaBuffer = "";
   while (GPS_SERIAL.available() > 0) {
     char c = GPS_SERIAL.read();
-    gps.encode(c);
-    dataReceived++;
-    gpsDetected = true;
     
-    // Store last NMEA line for debugging
-    static String currentLine = "";
+    // Process through TinyGPS++
+    if (gps.encode(c)) {
+      // Data was fully parsed
+      dataReceived++;
+      gpsDetected = true;
+    }
+    
+    // Build NMEA line for debugging
     if (c == '\n') {
-      if (currentLine.startsWith("$GP")) {
-        lastNMEALine = currentLine;
+      if (nmeaBuffer.length() > 6) { // Minimum viable NMEA sentence
+        lastNMEALine = nmeaBuffer;
         lastNMEALine.trim();
+        
+        // Debug output - show which sentences we're receiving
+        if (lastNMEALine.startsWith("$GP")) {
+          Serial.print("NMEA: ");
+          Serial.println(lastNMEALine.substring(0, 6)); // Show sentence type
+        }
       }
-      currentLine = "";
+      nmeaBuffer = "";
     } else if (c != '\r') {
-      currentLine += c;
+      nmeaBuffer += c;
     }
   }
 
@@ -457,6 +518,11 @@ void loop() {
     Serial.println();
     
     printRawDataPreview();
+    
+    // Check GPS status every 5 seconds
+    checkGPSStatus();
+    Serial.println();
+    
     printFooter();
     
     // Provide troubleshooting tips if needed
@@ -475,6 +541,8 @@ void loop() {
       Serial.println(COLOR_YELLOW "  • Keep device stationary" COLOR_RESET);
     }
   }
+
+  // LED blinking to show system is running
   static unsigned long lastBlink = 0;
   static bool ledState = false;
   if (millis() - lastBlink >= 500) {
