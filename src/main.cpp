@@ -1,4 +1,4 @@
-// Platform.ini file has been configured to include necessary libraries. with port settings.
+// Platform.ini file has been configured to include necessary libraries with port settings.
 #include <Arduino.h>
 #include <TinyGPSPlus.h>
 #include <Wire.h>
@@ -20,7 +20,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define GPS_TX_PIN 21  // ESP32 TX2 -> GPS RX
 
 // LED Configuration for ESP32
-#define LED_PIN 2  // Most ESP32 boards have built-in LED on GPIO2
+#define LED_PIN 2
 
 TinyGPSPlus gps;
 
@@ -28,17 +28,19 @@ TinyGPSPlus gps;
 unsigned long lastDisplay = 0;
 unsigned long dataReceived = 0;
 bool gpsDetected = false;
-String lastNMEALine = "";
+int maxSatsEverSeen = 0;
+unsigned long firstFixTime = 0;
+bool firstFixAchieved = false;
 
-// Color codes for serial monitor (if supported)
-#define COLOR_RESET   "\033[0m"
-#define COLOR_RED     "\033[31m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_YELLOW  "\033[33m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_MAGENTA "\033[35m"
-#define COLOR_CYAN    "\033[36m"
-#define COLOR_WHITE   "\033[37m"
+// GPS Performance tracking
+struct GPSStats {
+  unsigned long startupTime;
+  unsigned long timeToFirstFix;
+  int peakSatellites;
+  unsigned long totalSentences;
+  unsigned long validSentences;
+  float bestHDOP;
+} gpsStats = {0, 0, 0, 0, 0, 999.9};
 
 void setupOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -53,503 +55,415 @@ void setupOLED() {
   display.setTextSize(1);
   display.setCursor(0,0);
   display.println("AGNI SOIL SENSOR");
-  display.println("GPS + OLED TEST");
+  display.println("GPS FAST LOCK");
   display.println("Initializing...");
   display.display();
   delay(2000);
 }
 
 void setupGPS() {
-  // Wait a bit for module to initialize
-  delay(1000);
+  Serial.println("\n[GPS] Configuring for fast acquisition...");
+  delay(500);
   
-  Serial.println(COLOR_YELLOW "  ⚙️  Configuring GPS module..." COLOR_RESET);
-  
-  // Configure GPS to output recommended NMEA sentences
+  // CRITICAL: Hot start configuration for faster locks
+  // These commands optimize the GP-02 module for quick acquisition
   String configCommands[] = {
-    "$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28", // Enable GGA and RMC
-    "$PMTK301,2*2E", // Enable WAAS (SBAS)
-    "$PMTK313,1*2E", // Enable SBAS
-    "$PMTK319,1*24", // Set SBAS to test mode
-    "$PMTK220,1000*1F" // Set update rate to 1Hz
+    "$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28",  // GGA + RMC only (reduce overhead)
+    "$PMTK220,1000*1F",     // 1Hz update rate (standard)
+    "$PMTK301,2*2E",        // Enable DGPS/WAAS/EGNOS
+    "$PMTK313,1*2E",        // Enable SBAS
+    "$PMTK319,1*24",        // Set SBAS to test mode (helps acquisition)
+    "$PMTK286,1*23",        // Enable AIC (Active Interference Cancellation)
+    "$PMTK353,1,1,1,0,0*2A",// Enable GPS + GLONASS + Galileo (multi-GNSS for faster lock)
+    "$PMTK251,38400*27",    // Increase baud to 38400 for better throughput
   };
   
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 7; i++) {  // Don't send baud change yet
     GPS_SERIAL.println(configCommands[i]);
-    Serial.print(COLOR_BLUE "  📡 Sent: " COLOR_WHITE);
+    Serial.print("  -> Sent: ");
     Serial.println(configCommands[i]);
     delay(200);
   }
   
-  Serial.println(COLOR_GREEN "  ✅ GPS configuration complete" COLOR_RESET);
+  delay(500);
+  
+  // Now change to 38400 baud
+  GPS_SERIAL.println(configCommands[7]);
+  delay(300);
+  GPS_SERIAL.end();
+  GPS_SERIAL.begin(38400, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  
+  Serial.println("[GPS] Configuration complete - 38400 baud, Multi-GNSS enabled");
+  Serial.println("[GPS] Waiting for satellite acquisition...\n");
 }
 
 void updateOLED() {
   display.clearDisplay();
   display.setTextSize(1);
   
-  // Header with detailed fix status
+  // Header
   display.setCursor(0,0);
   display.print("AGNI GPS");
-  display.setCursor(80,0);
+  display.setCursor(70,0);
   
   if(gps.location.isValid()) {
-    display.print("3D FIX");
+    display.print("LOCKED");
   } else if (gps.satellites.value() >= 4) {
-    display.print("2D FIX");
+    display.print("LOCKING");
   } else {
-    display.print("NO FIX");
+    display.print("SEARCH");
   }
   
-  // Satellite information (more prominent)
+  // Satellite count
   display.setCursor(0,10);
-  display.print("Sats:");
+  display.print("Sats: ");
   display.print(gps.satellites.value());
-  display.print(" HDOP:");
+  display.print("/");
+  display.print(maxSatsEverSeen);
+  
   if(gps.hdop.isValid()) {
+    display.print(" H:");
     display.print(gps.hdop.hdop(), 1);
-  } else {
-    display.print("---");
   }
   
-  // Location with more debugging info
-  display.setCursor(0,20);
+  // Location
+  display.setCursor(0,22);
   if(gps.location.isValid()) {
-    display.print("Lat:");
-    display.print(gps.location.lat(), 6);
+    display.print("Lat: ");
+    display.print(gps.location.lat(), 5);
+    display.setCursor(0,32);
+    display.print("Lon: ");
+    display.print(gps.location.lng(), 5);
   } else {
-    display.print("Lat: Waiting fix...");
-  }
-  
-  display.setCursor(0,30);
-  if(gps.location.isValid()) {
-    display.print("Lng:");
-    display.print(gps.location.lng(), 6);
-  } else {
-    display.print("Lng: Sats:");
-    display.print(gps.satellites.value());
+    display.print("Acquiring fix...");
+    display.setCursor(0,32);
+    int dots = (millis() / 500) % 4;
+    display.print("Searching");
+    for(int i = 0; i < dots; i++) display.print(".");
   }
   
   // Time
-  display.setCursor(0,40);
+  display.setCursor(0,44);
   if(gps.time.isValid()) {
-    display.print("UTC ");
-    display.print(gps.time.hour());
-    display.print(":");
-    if(gps.time.minute() < 10) display.print("0");
-    display.print(gps.time.minute());
-    display.print(":");
-    if(gps.time.second() < 10) display.print("0");
-    display.print(gps.time.second());
+    char timeStr[12];
+    sprintf(timeStr, "%02d:%02d:%02d UTC", gps.time.hour(), gps.time.minute(), gps.time.second());
+    display.print(timeStr);
   } else {
     display.print("Time: --:--:--");
   }
   
-  // Additional status info
-  display.setCursor(0,50);
-  display.print("Data: ");
-  display.print(dataReceived);
-  display.print(" chars");
+  // Status bar
+  display.setCursor(0,54);
+  if (firstFixAchieved) {
+    display.print("Fix: ");
+    display.print(gpsStats.timeToFirstFix / 1000);
+    display.print("s");
+  } else {
+    display.print("Uptime: ");
+    display.print(millis() / 1000);
+    display.print("s");
+  }
   
   display.display();
 }
 
-void printHeader() {
-  Serial.println();
-  Serial.println(COLOR_CYAN "╔══════════════════════════════════════════════════════════════╗" COLOR_RESET);
-  Serial.println(COLOR_CYAN "║" COLOR_YELLOW "                   🛰️  AGNI SOIL SENSOR GPS TEST                   " COLOR_CYAN "║" COLOR_RESET);
-  Serial.println(COLOR_CYAN "╠══════════════════════════════════════════════════════════════╣" COLOR_RESET);
-  Serial.println(COLOR_CYAN "║" COLOR_WHITE "  Module: GP-02 | RX: GPIO20 | TX: GPIO21 | Baud: 9600  " COLOR_CYAN "║" COLOR_RESET);
-  Serial.println(COLOR_CYAN "╚══════════════════════════════════════════════════════════════╝" COLOR_RESET);
-  Serial.println();
+void printCleanHeader() {
+  Serial.println("\n╔════════════════════════════════════════════════════════════════════╗");
+  Serial.println("║              🛰️  AGNI GPS TRACKER - ENHANCED                      ║");
+  Serial.println("╠════════════════════════════════════════════════════════════════════╣");
+  Serial.println("║  Module: GP-02 Multi-GNSS  |  Baud: 38400  |  Update: 1Hz        ║");
+  Serial.println("╚════════════════════════════════════════════════════════════════════╝\n");
 }
 
-void printSatelliteVisual(int satellites) {
-  Serial.print(COLOR_BLUE "  🛰️  Satellites: " COLOR_GREEN);
-  Serial.print(satellites);
-  Serial.print("/12 ");
+void printGPSStatus() {
+  unsigned long uptime = millis() / 1000;
   
-  // Visual satellite indicator
-  Serial.print(COLOR_WHITE "[");
-  int bars = map(satellites, 0, 12, 0, 10);
-  for (int i = 0; i < 10; i++) {
-    if (i < bars) {
-      if (satellites >= 6) Serial.print(COLOR_GREEN "█");
-      else if (satellites >= 4) Serial.print(COLOR_YELLOW "█");
-      else Serial.print(COLOR_RED "█");
-    } else {
-      Serial.print(COLOR_WHITE " ");
+  Serial.println("┌─────────────────────── GPS STATUS ────────────────────────┐");
+  
+  // Fix Status
+  Serial.print("│ FIX STATUS:  ");
+  if (gps.location.isValid()) {
+    Serial.print("🟢 LOCKED");
+    if (!firstFixAchieved) {
+      firstFixAchieved = true;
+      firstFixTime = millis();
+      gpsStats.timeToFirstFix = firstFixTime - gpsStats.startupTime;
     }
+  } else if (gps.satellites.value() >= 4) {
+    Serial.print("🟡 ACQUIRING (Need 4+ sats)");
+  } else {
+    Serial.print("🔴 SEARCHING");
   }
-  Serial.print(COLOR_WHITE "]");
   
-  // Quality indicator
-  if (satellites == 0) Serial.print(COLOR_RED " ❌ NO SIGNAL");
-  else if (satellites < 4) Serial.print(COLOR_YELLOW " ⚠️  WEAK");
-  else if (satellites < 6) Serial.print(COLOR_YELLOW " 📶 GOOD");
-  else Serial.print(COLOR_GREEN " ✅ EXCELLENT");
-  Serial.println(COLOR_RESET);
+  // Time to fix
+  if (firstFixAchieved) {
+    Serial.print("  |  Fix in: ");
+    Serial.print(gpsStats.timeToFirstFix / 1000);
+    Serial.print("s");
+  }
+  Serial.println();
+  
+  // Satellites
+  Serial.print("│ SATELLITES:  ");
+  int sats = gps.satellites.value();
+  if (sats > maxSatsEverSeen) maxSatsEverSeen = sats;
+  
+  // Progress bar
+  Serial.print("[");
+  int bars = map(constrain(sats, 0, 12), 0, 12, 0, 20);
+  for (int i = 0; i < 20; i++) {
+    if (i < bars) Serial.print("█");
+    else Serial.print("·");
+  }
+  Serial.print("] ");
+  Serial.print(sats);
+  Serial.print("/");
+  Serial.print(maxSatsEverSeen);
+  Serial.println();
+  
+  // HDOP
+  Serial.print("│ ACCURACY:    HDOP: ");
+  if (gps.hdop.isValid()) {
+    float hdop = gps.hdop.hdop();
+    if (hdop < gpsStats.bestHDOP) gpsStats.bestHDOP = hdop;
+    
+    Serial.print(hdop, 2);
+    Serial.print(" (");
+    if (hdop < 1.0) Serial.print("Excellent");
+    else if (hdop < 2.0) Serial.print("Good");
+    else if (hdop < 5.0) Serial.print("Moderate");
+    else Serial.print("Fair");
+    Serial.print(")  |  Best: ");
+    Serial.print(gpsStats.bestHDOP, 2);
+  } else {
+    Serial.print("---");
+  }
+  Serial.println();
+  
+  Serial.println("└────────────────────────────────────────────────────────────┘\n");
 }
 
 void printLocationData() {
-  Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                      📍 LOCATION DATA                    " COLOR_CYAN "│" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
+  unsigned long uptime = millis() / 1000;
+  
+  Serial.println("┌────────────────────── LOCATION DATA ──────────────────────┐");
   
   if (gps.location.isValid()) {
-    Serial.print(COLOR_WHITE "  🌐 Latitude:  " COLOR_GREEN);
-    Serial.println(gps.location.lat(), 6);
+    char buffer[64];
     
-    Serial.print(COLOR_WHITE "  🌐 Longitude: " COLOR_GREEN);
-    Serial.println(gps.location.lng(), 6);
+    sprintf(buffer, "│ 🌍 Latitude:   %11.6f°", gps.location.lat());
+    Serial.println(buffer);
     
-    Serial.print(COLOR_WHITE "  📏 Altitude:  " COLOR_GREEN);
-    Serial.print(gps.altitude.meters(), 1);
-    Serial.println(COLOR_WHITE " meters" COLOR_RESET);
+    sprintf(buffer, "│ 🌍 Longitude:  %11.6f°", gps.location.lng());
+    Serial.println(buffer);
     
-    Serial.print(COLOR_WHITE "  🚀 Speed:     " COLOR_GREEN);
-    Serial.print(gps.speed.kmph(), 1);
-    Serial.println(COLOR_WHITE " km/h" COLOR_RESET);
+    if (gps.altitude.isValid()) {
+      sprintf(buffer, "│ 📍 Altitude:   %8.1f m", gps.altitude.meters());
+      Serial.println(buffer);
+    }
     
-    Serial.print(COLOR_WHITE "  🧭 Course:    " COLOR_GREEN);
-    Serial.print(gps.course.deg(), 1);
-    Serial.println(COLOR_WHITE "°" COLOR_RESET);
+    if (gps.speed.isValid()) {
+      sprintf(buffer, "│ 🚀 Speed:      %8.1f km/h", gps.speed.kmph());
+      Serial.println(buffer);
+    }
+    
+    if (gps.course.isValid()) {
+      sprintf(buffer, "│ 🧭 Course:     %8.1f°", gps.course.deg());
+      Serial.println(buffer);
+    }
+    
+    // Age of data
+    Serial.print("│ ⏱️  Data Age:   ");
+    Serial.print(gps.location.age());
+    Serial.println(" ms");
+    
   } else {
-    Serial.println(COLOR_RED "  ❌ Waiting for GPS fix..." COLOR_RESET);
-    Serial.print(COLOR_YELLOW "  💡 Current satellites: " COLOR_GREEN);
-    Serial.print(gps.satellites.value());
-    Serial.println(COLOR_YELLOW " (Need 4+ for 2D fix)" COLOR_RESET);
+    Serial.print("│ Status:  Waiting for fix... (");
+    Serial.print(uptime);
+    Serial.println("s elapsed)");
+    Serial.print("│ Tip:     ");
+    if (gps.satellites.value() == 0) {
+      Serial.println("Check antenna and move to open area");
+    } else {
+      Serial.print("Tracking ");
+      Serial.print(gps.satellites.value());
+      Serial.println(" satellites - fix imminent");
+    }
   }
+  
+  Serial.println("└────────────────────────────────────────────────────────────┘\n");
 }
 
 void printTimeData() {
-  Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                       ⏰ TIME DATA                      " COLOR_CYAN "│" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
+  Serial.println("┌─────────────────────── TIME DATA ─────────────────────────┐");
   
-  if (gps.time.isValid()) {
-    Serial.print(COLOR_WHITE "  🕒 UTC Time:  " COLOR_GREEN);
-    Serial.print(gps.time.hour());
-    Serial.print(":");
-    if (gps.time.minute() < 10) Serial.print("0");
-    Serial.print(gps.time.minute());
-    Serial.print(":");
-    if (gps.time.second() < 10) Serial.print("0");
-    Serial.println(gps.time.second());
-  } else {
-    Serial.println(COLOR_RED "  ❌ Time not available" COLOR_RESET);
-  }
-  
-  if (gps.date.isValid()) {
-    Serial.print(COLOR_WHITE "  📅 Date:      " COLOR_GREEN);
-    Serial.print(gps.date.day());
-    Serial.print("/");
-    Serial.print(gps.date.month());
-    Serial.print("/");
-    Serial.println(gps.date.year());
-  } else {
-    Serial.println(COLOR_RED "  ❌ Date not available" COLOR_RESET);
-  }
-}
-
-void printSignalQuality() {
-  Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                    📶 SIGNAL QUALITY                   " COLOR_CYAN "│" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
-  
-  if (gps.hdop.isValid()) {
-    Serial.print(COLOR_WHITE "  📊 HDOP:      " COLOR_GREEN);
-    Serial.print(gps.hdop.hdop(), 2);
-    Serial.print(COLOR_WHITE " (");
+  if (gps.time.isValid() && gps.date.isValid()) {
+    char buffer[64];
+    sprintf(buffer, "│ 🕐 UTC Time:   %02d:%02d:%02d", 
+            gps.time.hour(), gps.time.minute(), gps.time.second());
+    Serial.println(buffer);
     
-    float hdop = gps.hdop.hdop();
-    if (hdop < 1.0) {
-      Serial.print(COLOR_GREEN "Excellent");
-    } else if (hdop < 2.0) {
-      Serial.print(COLOR_GREEN "Good");
-    } else if (hdop < 5.0) {
-      Serial.print(COLOR_YELLOW "Moderate");
-    } else if (hdop < 10.0) {
-      Serial.print(COLOR_YELLOW "Fair");
-    } else {
-      Serial.print(COLOR_RED "Poor");
-    }
-    Serial.println(COLOR_WHITE ")" COLOR_RESET);
+    sprintf(buffer, "│ 📅 Date:       %02d/%02d/%04d", 
+            gps.date.day(), gps.date.month(), gps.date.year());
+    Serial.println(buffer);
   } else {
-    Serial.println(COLOR_RED "  ❌ HDOP not available" COLOR_RESET);
+    Serial.println("│ Status:  Time data not yet available");
   }
   
-  Serial.print(COLOR_WHITE "  ⏱️  Data Age:  " COLOR_GREEN);
-  Serial.print(gps.location.age());
-  Serial.println(COLOR_WHITE " ms" COLOR_RESET);
+  Serial.println("└────────────────────────────────────────────────────────────┘\n");
 }
 
 void printDiagnostics() {
-  Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                     🔧 DIAGNOSTICS                     " COLOR_CYAN "│" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
+  unsigned long uptime = millis() / 1000;
   
-  Serial.print(COLOR_WHITE "  📡 Data Stream: " COLOR_GREEN);
+  Serial.println("┌───────────────────── DIAGNOSTICS ─────────────────────────┐");
+  
+  Serial.print("│ 📊 Data Stream:     ");
   if (dataReceived > 0) {
-    Serial.print("✅ ACTIVE (");
+    Serial.print("✅ Active (");
     Serial.print(dataReceived);
     Serial.println(" chars)");
   } else {
-    Serial.println(COLOR_RED "❌ NO DATA" COLOR_RESET);
+    Serial.println("❌ No data");
   }
   
-  Serial.print(COLOR_WHITE "  🔄 Sentences:   " COLOR_GREEN);
+  Serial.print("│ 📝 Sentences:       ");
   Serial.print(gps.sentencesWithFix());
-  Serial.println(" with fix" COLOR_RESET);
-  
-  Serial.print(COLOR_WHITE "  ✅ Checksums:   " COLOR_GREEN);
+  Serial.print(" with fix / ");
   Serial.print(gps.passedChecksum());
-  Serial.print(COLOR_WHITE " passed, " COLOR_RED);
-  Serial.print(gps.failedChecksum());
-  Serial.println(" failed" COLOR_RESET);
+  Serial.println(" total");
+  
+  Serial.print("│ ✅ Checksum Pass:   ");
+  Serial.print(gps.passedChecksum());
+  Serial.print("  |  ❌ Failed: ");
+  Serial.println(gps.failedChecksum());
+  
+  Serial.print("│ ⏱️  System Uptime:  ");
+  Serial.print(millis() / 1000);
+  Serial.println(" seconds");
+  
+  Serial.println("└────────────────────────────────────────────────────────────┘\n");
 }
 
-void printConnectionStatus() {
-  Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                    🔌 CONNECTION STATUS                 " COLOR_CYAN "│" COLOR_RESET);
-  Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
-  
-  Serial.print(COLOR_WHITE "  📍 GPS Module:  ");
-  if (gpsDetected) {
-    Serial.println(COLOR_GREEN "✅ DETECTED AND WORKING" COLOR_RESET);
-  } else {
-    Serial.println(COLOR_RED "❌ NOT DETECTED" COLOR_RESET);
-    Serial.println(COLOR_YELLOW "  💡 Check: RX=GPIO20, TX=GPIO21, 3.3V Power, GND, Antenna" COLOR_RESET);
-  }
-  
-  Serial.print(COLOR_WHITE "  📊 GPS Fix:     ");
-  if (gps.location.isValid()) {
-    Serial.println(COLOR_GREEN "✅ ACTIVE FIX" COLOR_RESET);
-  } else {
-    Serial.println(COLOR_YELLOW "⏳ ACQUIRING FIX..." COLOR_RESET);
-  }
-}
-
-void printFooter() {
-  Serial.println();
-  Serial.println(COLOR_CYAN "╔══════════════════════════════════════════════════════════════╗" COLOR_RESET);
-  Serial.print(COLOR_CYAN "║" COLOR_WHITE "  Status: " COLOR_RESET);
-  
+void printQuickTips() {
   if (!gpsDetected) {
-    Serial.print(COLOR_RED "HARDWARE ISSUE - Check GPS connections");
+    Serial.println("⚠️  HARDWARE CHECK NEEDED:");
+    Serial.println("   • Verify 3.3V power to GPS module");
+    Serial.println("   • Check RX(GPIO20) → GPS TX connection");
+    Serial.println("   • Check TX(GPIO21) → GPS RX connection");
+    Serial.println("   • Ensure antenna is connected\n");
   } else if (!gps.location.isValid()) {
-    Serial.print(COLOR_YELLOW "ACQUIRING GPS FIX - Move to open area");
+    if (gps.satellites.value() == 0) {
+      Serial.println("💡 QUICK TIPS - No Satellites:");
+      Serial.println("   • Move to outdoor location or near window");
+      Serial.println("   • Ensure antenna has clear sky view");
+      Serial.println("   • Check GPS module LED is blinking");
+      Serial.println("   • Wait 30-60 seconds for initial acquisition\n");
+    } else {
+      Serial.println("💡 ACQUIRING FIX:");
+      Serial.print("   • Tracking ");
+      Serial.print(gps.satellites.value());
+      Serial.println(" satellites");
+      Serial.println("   • Keep device stationary");
+      Serial.println("   • Fix typically achieved in 30-180 seconds\n");
+    }
   } else {
-    Serial.print(COLOR_GREEN "GPS WORKING PERFECTLY - All systems go! 🎉");
-  }
-  
-  Serial.println(COLOR_CYAN "  ║" COLOR_RESET);
-  Serial.println(COLOR_CYAN "╚══════════════════════════════════════════════════════════════╝" COLOR_RESET);
-  Serial.println();
-}
-
-void printRawDataPreview() {
-  if (lastNMEALine.length() > 0) {
-    Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-    Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                   📡 LAST NMEA SENTENCE                  " COLOR_CYAN "│" COLOR_RESET);
-    Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
-    Serial.print(COLOR_MAGENTA "  ");
-    Serial.println(lastNMEALine);
+    Serial.println("✅ GPS WORKING PERFECTLY!");
+    Serial.print("   • Fix achieved in ");
+    Serial.print(gpsStats.timeToFirstFix / 1000);
+    Serial.println(" seconds");
+    Serial.print("   • Peak satellites: ");
+    Serial.println(maxSatsEverSeen);
+    Serial.print("   • Best HDOP: ");
+    Serial.println(gpsStats.bestHDOP, 2);
     Serial.println();
   }
 }
 
-void checkGPSStatus() {
-  static unsigned long lastStatusCheck = 0;
-  static int lastSatellites = 0;
-  
-  if (millis() - lastStatusCheck > 5000) {
-    lastStatusCheck = millis();
-    
-    Serial.println(COLOR_CYAN "  ┌────────────────────────────────────────────────────────┐" COLOR_RESET);
-    Serial.println(COLOR_CYAN "  │" COLOR_YELLOW "                     📊 GPS STATUS                      " COLOR_CYAN "│" COLOR_RESET);
-    Serial.println(COLOR_CYAN "  └────────────────────────────────────────────────────────┘" COLOR_RESET);
-    
-    Serial.print(COLOR_WHITE "  🛰️  Satellites: " COLOR_GREEN);
-    Serial.print(gps.satellites.value());
-    Serial.print(COLOR_WHITE " (Previous: " COLOR_YELLOW);
-    Serial.print(lastSatellites);
-    Serial.println(COLOR_WHITE ")" COLOR_RESET);
-    
-    Serial.print(COLOR_WHITE "  📍 Location:    ");
-    if (gps.location.isValid()) {
-      Serial.println(COLOR_GREEN "VALID FIX" COLOR_RESET);
-    } else {
-      Serial.println(COLOR_YELLOW "NO FIX" COLOR_RESET);
-    }
-    
-    if (gps.satellites.value() > lastSatellites) {
-      Serial.println(COLOR_GREEN "  📈 Satellites increasing - signal improving!" COLOR_RESET);
-    } else if (gps.satellites.value() < lastSatellites) {
-      Serial.println(COLOR_YELLOW "  📉 Satellites decreasing - check antenna position" COLOR_RESET);
-    }
-    
-    lastSatellites = gps.satellites.value();
-  }
-}
-
-void clearScreen() {
-  // Clear screen and move cursor to top (works in most terminal emulators)
-  Serial.print("\033[2J\033[H");
-}
-
 void setup() {
   Serial.begin(115200);
-  
-  // Initialize LED pin
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   
-  delay(2000); // Wait for serial connection
+  delay(1500);
   
-  // Initialize OLED first
   setupOLED();
   
-  clearScreen();
-  printHeader();
+  printCleanHeader();
   
-  Serial.println(COLOR_YELLOW "  🔄 Initializing GPS Module..." COLOR_RESET);
-  Serial.println();
-  
-  // Initialize GPS serial
+  Serial.println("[INIT] Starting GPS initialization...");
   GPS_SERIAL.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("[INIT] GPS Serial started at 9600 baud");
   
-  Serial.println(COLOR_GREEN "  ✅ GPS Serial initialized on RX=GPIO20, TX=GPIO21" COLOR_RESET);
+  gpsStats.startupTime = millis();
   
-  // Configure GPS module
   setupGPS();
   
-  Serial.println(COLOR_YELLOW "  📡 Listening for GPS data... (Timeout: 30 seconds)" COLOR_RESET);
-  Serial.println();
+  Serial.println("[INIT] Waiting for GPS data...\n");
   
-  // Wait for initial GPS data with timeout
+  // Wait for initial GPS data
   unsigned long startTime = millis();
-  bool initialDataReceived = false;
-  
-  while (millis() - startTime < 30000 && !initialDataReceived) {
+  while (millis() - startTime < 10000 && !gpsDetected) {
     while (GPS_SERIAL.available() > 0) {
       char c = GPS_SERIAL.read();
       gps.encode(c);
       dataReceived++;
-      initialDataReceived = true;
       gpsDetected = true;
     }
     delay(10);
   }
   
-  if (!gpsDetected) {
-    Serial.println(COLOR_RED "  ❌ No GPS data received within 30 seconds!" COLOR_RESET);
-    Serial.println(COLOR_YELLOW "  💡 Please check:" COLOR_RESET);
-    Serial.println(COLOR_YELLOW "     - GPS module power (3.3V)" COLOR_RESET);
-    Serial.println(COLOR_YELLOW "     - RX/TX connections (GPIO20/21)" COLOR_RESET);
-    Serial.println(COLOR_YELLOW "     - GPS module antenna" COLOR_RESET);
-    Serial.println(COLOR_YELLOW "     - Module baud rate (should be 9600)" COLOR_RESET);
+  if (gpsDetected) {
+    Serial.println("✅ GPS module detected and responding!\n");
   } else {
-    Serial.println(COLOR_GREEN "  ✅ GPS module detected! Starting continuous monitoring..." COLOR_RESET);
+    Serial.println("⚠️  No GPS data received - check connections\n");
   }
   
-  delay(2000);
+  delay(1000);
 }
 
 void loop() {
-  // Improved GPS data reading
-  static String nmeaBuffer = "";
+  // Read GPS data
   while (GPS_SERIAL.available() > 0) {
     char c = GPS_SERIAL.read();
-    
-    // Process through TinyGPS++
     if (gps.encode(c)) {
-      // Data was fully parsed
       dataReceived++;
       gpsDetected = true;
     }
-    
-    // Build NMEA line for debugging
-    if (c == '\n') {
-      if (nmeaBuffer.length() > 6) { // Minimum viable NMEA sentence
-        lastNMEALine = nmeaBuffer;
-        lastNMEALine.trim();
-        
-        // Debug output - show which sentences we're receiving
-        if (lastNMEALine.startsWith("$GP")) {
-          Serial.print("NMEA: ");
-          Serial.println(lastNMEALine.substring(0, 6)); // Show sentence type
-        }
-      }
-      nmeaBuffer = "";
-    } else if (c != '\r') {
-      nmeaBuffer += c;
-    }
   }
-
-  // Update display every 2 seconds
+  
+  // Update displays every 2 seconds
   if (millis() - lastDisplay >= 2000) {
     lastDisplay = millis();
     
-    // Update OLED first
+    // Update OLED
     updateOLED();
     
-    // Then update serial monitor
-    clearScreen();
-    printHeader();
+    // Clear and update serial
+    Serial.print("\033[2J\033[H");  // Clear screen
     
-    // Display all sections
-    printSatelliteVisual(gps.satellites.value());
-    Serial.println();
-    
+    printCleanHeader();
+    printGPSStatus();
     printLocationData();
-    Serial.println();
-    
     printTimeData();
-    Serial.println();
-    
-    printSignalQuality();
-    Serial.println();
-    
     printDiagnostics();
-    Serial.println();
+    printQuickTips();
     
-    printConnectionStatus();
-    Serial.println();
-    
-    printRawDataPreview();
-    
-    // Check GPS status every 5 seconds
-    checkGPSStatus();
-    Serial.println();
-    
-    printFooter();
-    
-    // Provide troubleshooting tips if needed
-    if (!gpsDetected) {
-      Serial.println(COLOR_RED "  🚨 TROUBLESHOOTING REQUIRED:" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  1. Check 3.3V power to GPS module" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  2. Verify RX(GPIO20) ←→ TX(GPS) connection" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  3. Verify TX(GPIO21) ←→ RX(GPS) connection" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  4. Ensure GPS antenna has clear sky view" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  5. Check GPS module LED is blinking" COLOR_RESET);
-    } else if (!gps.location.isValid()) {
-      Serial.println(COLOR_YELLOW "  💡 TIPS FOR FASTER GPS FIX:" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  • Move device near window or outdoors" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  • Ensure clear view of sky" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  • Wait 5-15 minutes for first-time fix" COLOR_RESET);
-      Serial.println(COLOR_YELLOW "  • Keep device stationary" COLOR_RESET);
-    }
+    Serial.println("════════════════════════════════════════════════════════════════════");
+    Serial.print("Last update: ");
+    Serial.print(millis() / 1000);
+    Serial.println("s | Press Ctrl+C to exit");
+    Serial.println("════════════════════════════════════════════════════════════════════\n");
   }
-
-  // LED blinking to show system is running
+  
+  // LED heartbeat
   static unsigned long lastBlink = 0;
   static bool ledState = false;
-  if (millis() - lastBlink >= 500) {
+  if (millis() - lastBlink >= (gps.location.isValid() ? 100 : 500)) {
     lastBlink = millis();
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState);
   }
-
+  
   delay(10);
 }
